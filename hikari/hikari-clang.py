@@ -18,6 +18,8 @@ def apple_ir(text):
     text = re.sub(r"\bcaptures\([^()]*\)", "", text)
     text = re.sub(r"\bnocreateundeforpoison\b", "", text)
     text = text.replace("icmp samesign ", "icmp ")
+    # optnone skips ARC contraction; this liveness marker has no machine code.
+    text = re.sub(r"(?m)^.*(?:call void \(\.\.\.\)|declare void) @llvm\.objc\.clang\.arc\.(?:noop\.)?use[^\n]*\n", "", text)
     # LLVM 22 removed the size operand; omit these optional lifetime hints.
     return re.sub(r"(?m)^.*(?:call void|declare void) @llvm\.lifetime\.(?:start|end)\.[^\n]*\n", "", text)
 

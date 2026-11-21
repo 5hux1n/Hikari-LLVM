@@ -337,7 +337,7 @@ struct StringEncryption : public ModulePass {
         llvm_unreachable("Unsupported CDS Type");
       }
       const unsigned Bits = intType->getBitWidth();
-      APInt Salt(Bits, cryptoutils->get_uint64_t());
+      APInt Salt = APInt(64, cryptoutils->get_uint64_t()).trunc(Bits);
       unsigned Rotation = cryptoutils->get_range(1, Bits);
       SmallVector<Constant *, 32> Mixed;
       unsigned PackedIndex = 0;
