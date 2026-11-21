@@ -2,7 +2,7 @@
 
 Hikari-LLVM 是面向 C、C++、Objective-C 和 Objective-C++ 的 LLVM 代码混淆工具，提供字符串与常量保护、控制流变换、指令替换，以及 Darwin 平台的反调试和反 Hook 检查。
 
-本仓库保留 Hikari 的 LLVM 源码，并在 `fix/arm64e-llvm22` 分支提供 **LLVM 22.1.8 独立插件与 Apple 编译入口**，用于 macOS / iOS 项目的 arm64、arm64e 代码生成。默认文档使用中文。
+本仓库保留 Hikari 的 LLVM 源码，并在 `main` 分支提供 **LLVM 22.1.8 独立插件与 Apple 编译入口**，用于 macOS / iOS 项目的 arm64、arm64e 代码生成。默认文档使用中文。
 
 ## 选择构建方式
 
@@ -18,7 +18,7 @@ Hikari-LLVM 是面向 C、C++、Objective-C 和 Objective-C++ 的 LLVM 代码混
 需要 macOS、Xcode 命令行工具、Python 3.10 或更新版本、CMake、Ninja 和 LLVM 22.1.8。以下路径使用 Apple Silicon 上的 Homebrew 布局。
 
 ```sh
-git clone --branch fix/arm64e-llvm22 https://github.com/5hux1n/Hikari-LLVM.git
+git clone --branch main https://github.com/5hux1n/Hikari-LLVM.git
 cd Hikari-LLVM
 
 cmake -S hikari -B cmake-build-arm64e -G Ninja \
