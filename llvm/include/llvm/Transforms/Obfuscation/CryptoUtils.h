@@ -1,5 +1,4 @@
-//===- CryptoUtils.h - Cryptographically Secure Pseudo-Random
-// Generator------------------===//
+//===- CryptoUtils.h - Seeded random layouts (not cryptographically secure) ---===//
 
 /*
   Copyright (C) 2017 Zhang(https://github.com/Naville/)

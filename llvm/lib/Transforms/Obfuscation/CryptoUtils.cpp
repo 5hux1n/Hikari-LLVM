@@ -2,9 +2,11 @@
 // [License](https://github.com/HikariObfuscator/Hikari/wiki/License).
 //===----------------------------------------------------------------------===//
 #include "llvm/Transforms/Obfuscation/CryptoUtils.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/Support/Format.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/RandomNumberGenerator.h"
 #include "llvm/Support/raw_ostream.h"
-#include <chrono>
 
 using namespace llvm;
 namespace llvm {
@@ -27,17 +29,14 @@ CryptoUtils::~CryptoUtils() {
     delete eng;
 }
 void CryptoUtils::prng_seed() {
-  using namespace std::chrono;
-  std::uint_fast64_t ms =
-      duration_cast<milliseconds>(system_clock::now().time_since_epoch())
-          .count();
-  errs() << format("std::mt19937_64 seeded with current timestamp: %" PRIu64 "",
-                   ms)
-         << "\n";
-  eng = new std::mt19937_64(ms);
+  uint64_t Seed;
+  if (auto EC = getRandomBytes(&Seed, sizeof(Seed)))
+    report_fatal_error(Twine("Hikari: cannot obtain random seed: ") + EC.message());
+  prng_seed(Seed);
 }
 void CryptoUtils::prng_seed(std::uint_fast64_t seed) {
   errs() << format("std::mt19937_64 seeded with: %" PRIu64 "", seed) << "\n";
+  delete eng;
   eng = new std::mt19937_64(seed);
 }
 std::uint_fast64_t CryptoUtils::get_raw() {
@@ -48,6 +47,8 @@ std::uint_fast64_t CryptoUtils::get_raw() {
 uint32_t CryptoUtils::get_range(uint32_t min, uint32_t max) {
   if (max == 0)
     return 0;
+  if (eng == nullptr)
+    prng_seed();
   std::uniform_int_distribution<uint32_t> dis(min, max - 1);
   return dis(*eng);
 }

@@ -2,6 +2,7 @@
 // [License](https://github.com/HikariObfuscator/Hikari/wiki/License).
 //===----------------------------------------------------------------------===//
 #include "llvm/Transforms/Obfuscation/Flattening.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/Passes/PassBuilder.h"
@@ -44,12 +45,8 @@ void Flattening::flatten(Function *f) {
   BasicBlock *loopEntry, *loopEnd;
   LoadInst *load;
   SwitchInst *switchI;
-  AllocaInst *switchVar, *switchVarAddr;
+  AllocaInst *switchVar;
   const DataLayout &DL = f->getParent()->getDataLayout();
-
-  // SCRAMBLER
-  std::unordered_map<uint32_t, uint32_t> scrambling_key;
-  // END OF SCRAMBLER
 
   PassBuilder PB;
   FunctionAnalysisManager FAM;
@@ -71,52 +68,26 @@ void Flattening::flatten(Function *f) {
     origBB.emplace_back(&BB);
   }
 
-  // Nothing to flatten
-  if (origBB.size() <= 1)
+  BasicBlock *insert = &f->getEntryBlock();
+  auto *entryBranch = dyn_cast<BranchInst>(insert->getTerminator());
+  if (origBB.size() <= 1 || !entryBranch)
     return;
 
-  // Remove first BB
+  // Demote PHIs while their original predecessor edges still exist.
+  fixStack(f);
+
   origBB.erase(origBB.begin());
-
-  // Get a pointer on the first BB
-  Function::iterator tmp = f->begin();
-  BasicBlock *insert = &*tmp;
-
-  // If main begin with an if
-  BranchInst *br = nullptr;
-  if (isa<BranchInst>(insert->getTerminator()))
-    br = cast<BranchInst>(insert->getTerminator());
-
-  if ((br && br->isConditional()) ||
-      insert->getTerminator()->getNumSuccessors() > 1) {
-    BasicBlock::iterator i = insert->end();
-    --i;
-
-    if (insert->size() > 1) {
-      --i;
-    }
-
-    BasicBlock *tmpBB = insert->splitBasicBlock(i, "first");
-    origBB.insert(origBB.begin(), tmpBB);
-  }
-
-  // Remove jump
+  if (entryBranch->isConditional())
+    origBB.insert(origBB.begin(), insert->splitBasicBlock(entryBranch, "first"));
   Instruction *oldTerm = insert->getTerminator();
+  BasicBlock *first = oldTerm->getSuccessor(0);
 
   // Create switch variable and set as it
   switchVar = new AllocaInst(Type::getInt32Ty(f->getContext()),
                              DL.getAllocaAddrSpace(), "switchVar", oldTerm);
-  switchVarAddr =
-      new AllocaInst(Type::getInt32Ty(f->getContext())->getPointerTo(),
-                     DL.getAllocaAddrSpace(), "", oldTerm);
 
   // Remove jump
   oldTerm->eraseFromParent();
-
-  new StoreInst(ConstantInt::get(Type::getInt32Ty(f->getContext()),
-                                 cryptoutils->scramble32(0, scrambling_key)),
-                switchVar, insert);
-  new StoreInst(switchVar, switchVarAddr, insert);
 
   // Create main loop
   loopEntry = BasicBlock::Create(f->getContext(), "loopEntry", f, insert);
@@ -124,6 +95,7 @@ void Flattening::flatten(Function *f) {
 
   load = new LoadInst(switchVar->getAllocatedType(), switchVar, "switchVar",
                       loopEntry);
+  load->setVolatile(true);
 
   // Move first BB on top
   insert->moveBefore(loopEntry);
@@ -137,27 +109,22 @@ void Flattening::flatten(Function *f) {
   BranchInst::Create(loopEnd, swDefault);
 
   // Create switch instruction itself and set condition
-  switchI = SwitchInst::Create(&*f->begin(), swDefault, 0, loopEntry);
-  switchI->setCondition(load);
-
-  // Remove branch jump from 1st BB and make a jump to the while
-  f->begin()->getTerminator()->eraseFromParent();
-
-  BranchInst::Create(loopEntry, &*f->begin());
+  switchI = SwitchInst::Create(load, swDefault, origBB.size(), loopEntry);
 
   // Put BB in the switch
+  DenseSet<uint32_t> caseValues;
   for (BasicBlock *i : origBB) {
-    ConstantInt *numCase = nullptr;
-
     // Move the BB inside the switch (only visual, no code logic)
     i->moveBefore(loopEnd);
 
-    // Add case to switch
-    numCase = cast<ConstantInt>(ConstantInt::get(
-        switchI->getCondition()->getType(),
-        cryptoutils->scramble32(switchI->getNumCases(), scrambling_key)));
-    switchI->addCase(numCase, i);
+    uint32_t value;
+    do {
+      value = cryptoutils->get_uint32_t();
+    } while (!caseValues.insert(value).second);
+    switchI->addCase(ConstantInt::get(Type::getInt32Ty(f->getContext()), value), i);
   }
+  new StoreInst(switchI->findCaseDest(first), switchVar, true,
+                insert->getTerminator());
 
   // Recalculate switchVar
   for (BasicBlock *i : origBB) {
@@ -172,19 +139,8 @@ void Flattening::flatten(Function *f) {
       // Get next case
       numCase = switchI->findCaseDest(succ);
 
-      // If next case == default case (switchDefault)
-      if (!numCase) {
-        numCase = cast<ConstantInt>(
-            ConstantInt::get(switchI->getCondition()->getType(),
-                             cryptoutils->scramble32(switchI->getNumCases() - 1,
-                                                     scrambling_key)));
-      }
-
       // Update switchVar and jump to the end of loop
-      new StoreInst(
-          numCase,
-          new LoadInst(switchVarAddr->getAllocatedType(), switchVarAddr, "", i),
-          i);
+      new StoreInst(numCase, switchVar, true, i);
       BranchInst::Create(loopEnd, i);
       continue;
     }
@@ -197,21 +153,6 @@ void Flattening::flatten(Function *f) {
       ConstantInt *numCaseFalse =
           switchI->findCaseDest(i->getTerminator()->getSuccessor(1));
 
-      // Check if next case == default case (switchDefault)
-      if (!numCaseTrue) {
-        numCaseTrue = cast<ConstantInt>(
-            ConstantInt::get(switchI->getCondition()->getType(),
-                             cryptoutils->scramble32(switchI->getNumCases() - 1,
-                                                     scrambling_key)));
-      }
-
-      if (!numCaseFalse) {
-        numCaseFalse = cast<ConstantInt>(
-            ConstantInt::get(switchI->getCondition()->getType(),
-                             cryptoutils->scramble32(switchI->getNumCases() - 1,
-                                                     scrambling_key)));
-      }
-
       // Create a SelectInst
       BranchInst *br = cast<BranchInst>(i->getTerminator());
       SelectInst *sel =
@@ -221,10 +162,7 @@ void Flattening::flatten(Function *f) {
       // Erase terminator
       i->getTerminator()->eraseFromParent();
       // Update switchVar and jump to the end of loop
-      new StoreInst(
-          sel,
-          new LoadInst(switchVarAddr->getAllocatedType(), switchVarAddr, "", i),
-          i);
+      new StoreInst(sel, switchVar, true, i);
       BranchInst::Create(loopEnd, i);
       continue;
     }

@@ -591,7 +591,7 @@ public:
 
   /// Determine whether this data operand is not captured.
   bool doesNotCapture(unsigned OpNo) const {
-    return dataOperandHasImpliedAttr(OpNo + 1, Attribute::NoCapture);
+    return cast<CallBase>(getInstruction())->doesNotCapture(OpNo);
   }
 
   /// Determine whether this argument is passed by value.

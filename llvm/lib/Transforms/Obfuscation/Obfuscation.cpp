@@ -13,7 +13,7 @@
 using namespace llvm;
 
 // Begin Obfuscator Options
-static cl::opt<uint64_t> AesSeed("aesSeed", cl::init(0x1337),
+static cl::opt<uint64_t> AesSeed("aesSeed", cl::init(0),
                                  cl::desc("seed for the PRNG"));
 static cl::opt<bool> EnableAntiClassDump("enable-acdobf", cl::init(false),
                                          cl::NotHidden,
@@ -76,7 +76,7 @@ static void LoadEnv(void) {
     EnableIndirectBranching = true;
   }
   if (getenv("FUNCWRA")) {
-    EnableFunctionWrapper = true; // Broken
+    EnableFunctionWrapper = true;
   }
   if (getenv("BCFOBF")) {
     EnableBogusControlFlow = true;
@@ -115,8 +115,11 @@ struct Obfuscation : public ModulePass {
     errs() << "Running Hikari On " << M.getSourceFileName() << "\n";
 
     annotation2Metadata(M);
+    for (Function &F : M)
+      if (readAnnotationMetadata(&F, "hikari_preserve"))
+        turnOffOptimization(&F);
 
-    ModulePass *MP = createAntiHookPass(EnableAntiHooking);
+    ModulePass *MP = createAntiHookPass(EnableAllObfuscation || EnableAntiHooking);
     MP->doInitialization(M);
     MP->runOnModule(M);
     delete MP;
@@ -134,7 +137,7 @@ struct Obfuscation : public ModulePass {
       if (!F.isDeclaration())
         FP->runOnFunction(F);
     delete FP;
-    MP = createAntiDebuggingPass(EnableAntiDebugging);
+    MP = createAntiDebuggingPass(EnableAllObfuscation || EnableAntiDebugging);
     MP->runOnModule(M);
     delete MP;
     // Now Encrypt Strings
@@ -161,7 +164,7 @@ struct Obfuscation : public ModulePass {
         P->runOnFunction(F);
         delete P;
       }
-    MP = createConstantEncryptionPass(EnableConstantEncryption);
+    MP = createConstantEncryptionPass(EnableAllObfuscation || EnableConstantEncryption);
     MP->runOnModule(M);
     delete MP;
     errs() << "Doing Post-Run Cleanup\n";
@@ -203,7 +206,7 @@ struct Obfuscation : public ModulePass {
 };
 ModulePass *createObfuscationLegacyPass() {
   LoadEnv();
-  if (AesSeed != 0x1337) {
+  if (AesSeed.getNumOccurrences()) {
     cryptoutils->prng_seed(AesSeed);
   } else {
     cryptoutils->prng_seed();
@@ -214,7 +217,8 @@ ModulePass *createObfuscationLegacyPass() {
 }
 
 PreservedAnalyses ObfuscationPass::run(Module &M, ModuleAnalysisManager &MAM) {
-  if (createObfuscationLegacyPass()->runOnModule(M)) {
+  std::unique_ptr<ModulePass> P(createObfuscationLegacyPass());
+  if (P->runOnModule(M)) {
     return PreservedAnalyses::none();
   }
   return PreservedAnalyses::all();

@@ -55,12 +55,20 @@ struct FunctionWrapper : public ModulePass {
               callsites.emplace_back(new CallSite(&Inst));
       }
     }
-    for (CallSite *CS : callsites)
+    for (CallSite *CS : callsites) {
       for (uint32_t i = 0; i < ObfTimes && CS != nullptr; i++)
         CS = HandleCallSite(CS);
+      delete CS;
+    }
     return true;
   } // End of runOnModule
   CallSite *HandleCallSite(CallSite *CS) {
+    std::unique_ptr<CallSite> Owner(CS);
+    auto *Original = cast<CallBase>(CS->getInstruction());
+    if (Original->getNumOperandBundles() ||
+        Original->hasFnAttr(Attribute::ReturnsTwice) ||
+        (isa<CallInst>(Original) && cast<CallInst>(Original)->isMustTailCall()))
+      return nullptr;
     Value *calledFunction = CS->getCalledFunction();
     if (calledFunction == nullptr)
       calledFunction = CS->getCalledValue()->stripPointerCasts();
@@ -74,7 +82,6 @@ struct FunctionWrapper : public ModulePass {
          !isa<Function>(calledFunction)) ||
         CS->getIntrinsicID() != Intrinsic::not_intrinsic)
       return nullptr;
-    SmallVector<unsigned int, 8> byvalArgNums;
     if (Function *tmp = dyn_cast<Function>(calledFunction)) {
 #if LLVM_VERSION_MAJOR >= 18
       if (tmp->getName().starts_with("clang.")) {
@@ -84,13 +91,11 @@ struct FunctionWrapper : public ModulePass {
         // Clang Intrinsic
         return nullptr;
       }
-      for (Argument &arg : tmp->args()) {
-        if (arg.hasStructRetAttr() || arg.hasSwiftSelfAttr()) {
+      if (tmp->hasFnAttribute(Attribute::ReturnsTwice))
+        return nullptr;
+      for (Argument &arg : tmp->args())
+        if (arg.hasSwiftSelfAttr())
           return nullptr;
-        }
-        if (arg.hasByValAttr())
-          byvalArgNums.emplace_back(arg.getArgNo());
-      }
     }
     // Create a new function which in turn calls the actual function
     SmallVector<Type *, 8> types;
@@ -102,43 +107,34 @@ struct FunctionWrapper : public ModulePass {
         Function::Create(ft, GlobalValue::LinkageTypes::InternalLinkage,
                          "HikariFunctionWrapper", CS->getParent()->getModule());
     func->setCallingConv(CS->getCallingConv());
+    SmallVector<AttributeSet, 8> ParamAttrs;
+    for (unsigned I = 0; I < Original->arg_size(); ++I)
+      ParamAttrs.push_back(Original->getAttributes().getParamAttrs(I));
+    func->setAttributes(AttributeList::get(
+        func->getContext(), {}, Original->getAttributes().getRetAttrs(),
+        ParamAttrs));
+    func->addFnAttr(Attribute::NoInline);
+    for (StringRef Name : {"target-cpu", "target-features", "target-abi",
+                           "ptrauth-calls", "ptrauth-returns"})
+      if (Original->getFunction()->hasFnAttribute(Name))
+        func->addFnAttr(Original->getFunction()->getFnAttribute(Name));
     // Trolling was all fun and shit so old implementation forced this symbol to
     // exist in all objects
     appendToCompilerUsed(*func->getParent(), {func});
     BasicBlock *BB = BasicBlock::Create(func->getContext(), "", func);
     SmallVector<Value *, 8> params;
-    if (byvalArgNums.empty())
-      for (Argument &arg : func->args())
-        params.emplace_back(&arg);
-    else
-      for (Argument &arg : func->args()) {
-        if (std::find(byvalArgNums.begin(), byvalArgNums.end(),
-                      arg.getArgNo()) != byvalArgNums.end()) {
-          params.emplace_back(&arg);
-        } else {
-          AllocaInst *AI = nullptr;
-          if (!BB->empty()) {
-            BasicBlock::iterator InsertPoint = BB->begin();
-            while (isa<AllocaInst>(InsertPoint))
-              ++InsertPoint;
-            AI = new AllocaInst(arg.getType(), 0, "", &*InsertPoint);
-          } else
-            AI = new AllocaInst(arg.getType(), 0, "", BB);
-          new StoreInst(&arg, AI, BB);
-          LoadInst *LI = new LoadInst(AI->getAllocatedType(), AI, "", BB);
-          params.emplace_back(LI);
-        }
-      }
-    Value *retval = CallInst::Create(
+    for (Argument &Arg : func->args())
+      params.push_back(&Arg);
+    CallInst *retval = CallInst::Create(
         CS->getFunctionType(),
         ConstantExpr::getBitCast(cast<Function>(calledFunction),
                                  CS->getCalledValue()->getType()),
-#if LLVM_VERSION_MAJOR >= 16
-        ArrayRef<Value *>(params), std::nullopt, "", BB);
-#else
-        ArrayRef<Value *>(params), None, "", BB);
-#endif
-    if (ft->getReturnType()->isVoidTy()) {
+        ArrayRef<Value *>(params), "", BB);
+    retval->setCallingConv(Original->getCallingConv());
+    retval->setAttributes(Original->getAttributes());
+    if (Original->doesNotReturn()) {
+      new UnreachableInst(func->getContext(), BB);
+    } else if (ft->getReturnType()->isVoidTy()) {
       ReturnInst::Create(BB->getContext(), BB);
     } else {
       ReturnInst::Create(BB->getContext(), retval, BB);
@@ -146,7 +142,6 @@ struct FunctionWrapper : public ModulePass {
     CS->setCalledFunction(func);
     CS->mutateFunctionType(ft);
     Instruction *Inst = CS->getInstruction();
-    delete CS;
     return new CallSite(Inst);
   }
 };

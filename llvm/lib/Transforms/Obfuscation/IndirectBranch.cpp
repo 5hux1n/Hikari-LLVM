@@ -36,8 +36,10 @@ struct IndirectBranch : public FunctionPass {
   static char ID;
   bool flag;
   bool initialized;
+  GlobalVariable *GlobalTable = nullptr;
   std::unordered_map<BasicBlock *, unsigned long long> indexmap;
   std::unordered_map<Function *, ConstantInt *> encmap;
+  std::unordered_map<Function *, bool> stackmap;
   std::unordered_set<Function *> to_obf_funcs;
   IndirectBranch() : FunctionPass(ID) {
     this->flag = true;
@@ -64,6 +66,7 @@ struct IndirectBranch : public FunctionPass {
         to_obf_funcs.insert(&F);
       if (!toObfuscateBoolOption(&F, "indibran_use_stack", &UseStackTemp))
         UseStackTemp = UseStack;
+      stackmap[&F] = UseStackTemp;
 
       // See https://github.com/61bcdefg/Hikari-LLVM15/issues/32
       FPM.run(F, FAM);
@@ -78,6 +81,8 @@ struct IndirectBranch : public FunctionPass {
             cryptoutils->get_range(UINT8_MAX, UINT16_MAX * 2) * 4);
       for (BasicBlock &BB : F)
         if (!BB.isEntryBlock()) {
+          // Apple's IR reader misresolves mixed named/numbered blockaddresses.
+          BB.setName("hikari.block");
           indexmap[&BB] = i++;
           BBs.emplace_back(
               EncryptJumpTargetTemp
@@ -95,10 +100,10 @@ struct IndirectBranch : public FunctionPass {
           Type::getInt8Ty(M.getContext())->getPointerTo(), BBs.size());
       Constant *BlockAddressArray =
           ConstantArray::get(AT, ArrayRef<Constant *>(BBs));
-      GlobalVariable *Table = new GlobalVariable(
+      GlobalTable = new GlobalVariable(
           M, AT, false, GlobalValue::LinkageTypes::PrivateLinkage,
           BlockAddressArray, "IndirectBranchingGlobalTable");
-      appendToCompilerUsed(M, {Table});
+      appendToCompilerUsed(M, {GlobalTable});
     }
     this->initialized = true;
     return true;
@@ -111,6 +116,8 @@ struct IndirectBranch : public FunctionPass {
         to_obf_funcs.end())
       return false;
     errs() << "Running IndirectBranch On " << Func.getName() << "\n";
+    const bool UseStackTemp = stackmap[&Func];
+    const bool EncryptJumpTargetTemp = encmap.count(&Func) != 0;
     SmallVector<BranchInst *, 32> BIs;
     for (Instruction &Inst : instructions(Func))
       if (BranchInst *BI = dyn_cast<BranchInst>(&Inst))
@@ -160,7 +167,7 @@ struct IndirectBranch : public FunctionPass {
             BlockAddressArray, "HikariConditionalLocalIndirectBranchingTable");
         appendToCompilerUsed(*Func.getParent(), {LoadFrom});
       } else {
-        LoadFrom = M->getGlobalVariable("IndirectBranchingGlobalTable", true);
+        LoadFrom = GlobalTable;
       }
       AllocaInst *LoadFromAI = nullptr;
       if (UseStackTemp) {
@@ -216,18 +223,18 @@ struct IndirectBranch : public FunctionPass {
             {zero, BI->isConditional() ? IRBBI->CreateLoad(Int32Ty, RealIndex)
                                        : RealIndex});
         if (!EncryptJumpTargetTemp)
-          LI = IRBBI->CreateLoad(Int8PtrTy, GEP,
+          LI = IRBBI->CreateLoad(Int8PtrTy, GEP, true,
                                  "IndirectBranchingTargetAddress");
         else
-          gepptr = IRBBI->CreateLoad(Int8PtrTy, GEP);
+          gepptr = IRBBI->CreateLoad(Int8PtrTy, GEP, true);
       } else {
         Value *GEP = IRBBI->CreateGEP(LoadFrom->getValueType(), LoadFrom,
                                       {zero, RealIndex});
         if (!EncryptJumpTargetTemp)
-          LI = IRBBI->CreateLoad(Int8PtrTy, GEP,
+          LI = IRBBI->CreateLoad(Int8PtrTy, GEP, true,
                                  "IndirectBranchingTargetAddress");
         else
-          gepptr = IRBBI->CreateLoad(Int8PtrTy, GEP);
+          gepptr = IRBBI->CreateLoad(Int8PtrTy, GEP, true);
       }
       if (EncryptJumpTargetTemp) {
         ConstantInt *encenckey = cast<ConstantInt>(
@@ -264,10 +271,10 @@ struct IndirectBranch : public FunctionPass {
     for (size_t i = blocks.size() - 1; i > 0; i--)
       std::swap(blocks[i], blocks[cryptoutils->get_range(i + 1)]);
 
-    Function::iterator fi = F.begin();
+    BasicBlock *Previous = &F.getEntryBlock();
     for (BasicBlock *block : blocks) {
-      fi++;
-      block->moveAfter(&*(fi));
+      block->moveAfter(Previous);
+      Previous = block;
     }
   }
 };

@@ -73,7 +73,7 @@ Hikari adds the following obfuscation passes to LLVM/Clang. All flags are passed
 #### Indirect Branching
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-indibran-use-stack` | false | Load jump table address from stack |
+| `-indibran-use-stack` | true | Load jump table address from stack |
 | `-indibran-enc-jump-target` | false | Encrypt jump table and indices |
 
 #### Instruction Substitution
@@ -90,12 +90,13 @@ Hikari adds the following obfuscation passes to LLVM/Clang. All flags are passed
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-ah_inline` | true | Check for inline hooks |
+| `-ah_objcruntime` | true | Check Objective-C method implementations at entry and same-module message call sites |
 | `-ah_antirebind` | false | Prevent fishhook symbol rebinding |
 
 #### Anti-Debugging (iOS/macOS)
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-adb_prob` | 40 | Probability of adding anti-debug checks |
+| `-adb_prob` | 40 | Percentage of extra function-entry guards; load-time initialization is always installed |
 
 #### Miscellaneous
 | Flag | Default | Description |
@@ -103,6 +104,8 @@ Hikari adds the following obfuscation passes to LLVM/Clang. All flags are passed
 | `-aesSeed` | 0x1337 | Seed for AES encryption |
 
 ## Building
+
+For the standalone LLVM 22.1.8 plugin build and arm64e compatibility, see [hikari/COMPATIBILITY.md](hikari/COMPATIBILITY.md). `-enable-allobf` also enables anti-debugging, anti-hooking and constant encryption.
 
 ```bash
 git clone https://github.com/nkhmelni/Hikari-LLVM.git

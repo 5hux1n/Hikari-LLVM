@@ -31,6 +31,12 @@ bool valueEscapes(Instruction *Inst) {
 }
 
 void fixStack(Function *f) {
+  // Demoted pointers no longer satisfy LLVM 22's alloca-only lifetime contract.
+  for (Instruction &I : make_early_inc_range(instructions(f)))
+    if (auto *II = dyn_cast<IntrinsicInst>(&I))
+      if (II->getIntrinsicID() == Intrinsic::lifetime_start ||
+          II->getIntrinsicID() == Intrinsic::lifetime_end)
+        II->eraseFromParent();
   // Try to remove phi node and demote reg to stack
   SmallVector<PHINode *, 8> tmpPhi;
   SmallVector<Instruction *, 32> tmpReg;
@@ -122,6 +128,9 @@ bool readFlag(Function *f, std::string attribute) {
 }
 
 bool toObfuscate(bool flag, Function *f, std::string attribute) {
+  // Runtime helpers must not instrument themselves or acquire recursive guards.
+  if (f->hasFnAttribute("hikari.runtime"))
+    return false;
   // Check if declaration and external linkage
   if (f->isDeclaration() || f->hasAvailableExternallyLinkage()) {
     return false;
@@ -132,7 +141,21 @@ bool toObfuscate(bool flag, Function *f, std::string attribute) {
     return false;
   }
   if (readAnnotationMetadata(f, attr) || readFlag(f, attr)) {
-    return true;
+    flag = true;
+  }
+  if (flag) {
+    // Added checks and global accesses invalidate pre-obfuscation effect
+    // summaries.
+    for (Attribute::AttrKind Kind :
+         {Attribute::Memory, Attribute::NoFree, Attribute::NoSync,
+          Attribute::NoRecurse, Attribute::Speculatable, Attribute::WillReturn,
+          Attribute::MustProgress}) {
+      f->removeFnAttr(Kind);
+      for (User *U : f->users())
+        if (auto *Call = dyn_cast<CallBase>(U))
+          if (Call->getCalledOperand()->stripPointerCasts() == f)
+            Call->removeFnAttr(Kind);
+    }
   }
   return flag;
 }
@@ -270,11 +293,9 @@ void FixFunctionConstantExpr(Function *Func) {
 void turnOffOptimization(Function *f) {
   f->removeFnAttr(Attribute::AttrKind::MinSize);
   f->removeFnAttr(Attribute::AttrKind::OptimizeForSize);
-  if (!f->hasFnAttribute(Attribute::AttrKind::OptimizeNone) &&
-      !f->hasFnAttribute(Attribute::AttrKind::AlwaysInline)) {
-    f->addFnAttr(Attribute::AttrKind::OptimizeNone);
-    f->addFnAttr(Attribute::AttrKind::NoInline);
-  }
+  f->removeFnAttr(Attribute::AttrKind::AlwaysInline);
+  f->addFnAttr(Attribute::AttrKind::OptimizeNone);
+  f->addFnAttr(Attribute::AttrKind::NoInline);
 }
 
 static inline std::vector<std::string> splitString(std::string str) {

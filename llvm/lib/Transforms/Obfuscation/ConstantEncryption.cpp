@@ -213,7 +213,7 @@ struct ConstantEncryption : public ModulePass {
     for (Instruction &I : instructions(F)) {
       if (!shouldEncryptConstant(&I))
         continue;
-      CallInst *CI = dyn_cast<CallInst>(&I);
+      CallBase *CI = dyn_cast<CallBase>(&I);
       for (unsigned i = 0; i < I.getNumOperands(); i++) {
         if (CI && CI->isBundleOperand(i))
           continue;
@@ -349,8 +349,12 @@ struct ConstantEncryption : public ModulePass {
     ConstantInt *New = keyandnew.second;
     if (!Key || !New)
       return;
+    auto *KeyGV = new GlobalVariable(
+        *I->getModule(), Key->getType(), false, GlobalValue::PrivateLinkage,
+        Key, "ConstantEncryptionKey");
+    auto *KeyLoad = new LoadInst(Key->getType(), KeyGV, "", true, I);
     BinaryOperator *NewOperand =
-        BinaryOperator::Create(Instruction::Xor, New, Key, "", I);
+        BinaryOperator::Create(Instruction::Xor, New, KeyLoad, "", I);
 
     I->setOperand(opindex, NewOperand);
     if (SubstituteXorTemp &&

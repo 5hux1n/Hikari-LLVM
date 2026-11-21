@@ -2,6 +2,8 @@
 // [License](https://github.com/HikariObfuscator/Hikari/wiki/License).
 //===----------------------------------------------------------------------===//
 #include "llvm/Transforms/Obfuscation/StringEncryption.h"
+#include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
@@ -28,12 +30,15 @@ struct StringEncryption : public ModulePass {
   bool flag;
   bool appleptrauth;
   bool opaquepointers;
-  std::unordered_map<Function * /*Function*/,
-                     GlobalVariable * /*Decryption Status*/>
-      encstatus;
-  std::unordered_map<GlobalVariable *, std::pair<Constant *, GlobalVariable *>>
+  MapVector<GlobalVariable *, GlobalVariable *> encstatus;
+  struct Cipher {
+    GlobalVariable *Salt;
+    unsigned Rotation;
+  };
+  MapVector<GlobalVariable *, Cipher> ciphers;
+  MapVector<GlobalVariable *, std::pair<Constant *, GlobalVariable *>>
       mgv2keys;
-  std::unordered_map<Constant *, SmallVector<unsigned int, 16>>
+  MapVector<Constant *, SmallVector<unsigned int, 16>>
       unencryptedindex;
   SmallVector<GlobalVariable *, 32> genedgv;
   StringEncryption() : ModulePass(ID) { this->flag = true; }
@@ -84,12 +89,6 @@ struct StringEncryption : public ModulePass {
                     "-strcry_prob=x must be 0 < x <= 100";
           return false;
         }
-        Constant *S =
-            ConstantInt::getNullValue(Type::getInt32Ty(M.getContext()));
-        GlobalVariable *GV = new GlobalVariable(
-            M, S->getType(), false, GlobalValue::LinkageTypes::PrivateLinkage,
-            S, "StringEncryptionEncStatus");
-        encstatus[&F] = GV;
         HandleFunction(&F);
       }
     return true;
@@ -97,10 +96,10 @@ struct StringEncryption : public ModulePass {
 
   void
   processConstantAggregate(GlobalVariable *strGV, ConstantAggregate *CA,
-                           std::unordered_set<GlobalVariable *> *rawStrings,
+                           SetVector<GlobalVariable *> *rawStrings,
                            SmallVector<GlobalVariable *, 32> *unhandleablegvs,
                            SmallVector<GlobalVariable *, 32> *Globals,
-                           std::unordered_set<User *> *Users, bool *breakFor) {
+                           SetVector<User *> *Users, bool *breakFor) {
     for (unsigned i = 0; i < CA->getNumOperands(); i++) {
       Constant *Op = CA->getOperand(i);
       if (GlobalVariable *GV =
@@ -128,7 +127,7 @@ struct StringEncryption : public ModulePass {
   }
 
   void HandleUser(User *U, SmallVector<GlobalVariable *, 32> &Globals,
-                  std::unordered_set<User *> &Users,
+                  SetVector<User *> &Users,
                   std::unordered_set<User *> &VisitedUsers) {
     VisitedUsers.emplace(U);
     for (Value *Op : U->operands()) {
@@ -148,18 +147,18 @@ struct StringEncryption : public ModulePass {
   void HandleFunction(Function *Func) {
     FixFunctionConstantExpr(Func);
     SmallVector<GlobalVariable *, 32> Globals;
-    std::unordered_set<User *> Users;
+    SetVector<User *> Users;
     {
       std::unordered_set<User *> VisitedUsers;
       for (Instruction &I : instructions(Func))
         HandleUser(&I, Globals, Users, VisitedUsers);
     }
-    std::unordered_set<GlobalVariable *> rawStrings;
-    std::unordered_set<GlobalVariable *> objCStrings;
-    std::unordered_map<GlobalVariable *,
+    SetVector<GlobalVariable *> rawStrings;
+    SetVector<GlobalVariable *> objCStrings;
+    MapVector<GlobalVariable *,
                        std::pair<Constant *, GlobalVariable *>>
         GV2Keys;
-    std::unordered_map<GlobalVariable * /*old*/,
+    MapVector<GlobalVariable * /*old*/,
                        std::pair<GlobalVariable * /*encrypted*/,
                                  GlobalVariable * /*decrypt space*/>>
         old2new;
@@ -337,11 +336,31 @@ struct StringEncryption : public ModulePass {
       } else {
         llvm_unreachable("Unsupported CDS Type");
       }
+      const unsigned Bits = intType->getBitWidth();
+      APInt Salt(Bits, cryptoutils->get_uint64_t());
+      unsigned Rotation = cryptoutils->get_range(1, Bits);
+      SmallVector<Constant *, 32> Mixed;
+      unsigned PackedIndex = 0;
+      for (unsigned I = 0; I < CDS->getNumElements(); ++I) {
+        if (llvm::is_contained(unencryptedindex[GV], I))
+          continue;
+        APInt Key = cast<ConstantInt>(KeyConst->getAggregateElement(I))->getValue();
+        APInt Value = cast<ConstantInt>(
+            EncryptedConst->getAggregateElement(PackedIndex++))->getValue() ^ Key;
+        Mixed.push_back(ConstantInt::get(M->getContext(),
+                                         (Value + Salt).rotl(Rotation) ^ Key));
+      }
+      EncryptedConst = ConstantArray::get(
+          ArrayType::get(intType, Mixed.size()), Mixed);
       // Prepare new rawGV
       GlobalVariable *EncryptedRawGV = new GlobalVariable(
           *M, EncryptedConst->getType(), false, GV->getLinkage(),
           EncryptedConst, "EncryptedString", nullptr, GV->getThreadLocalMode(),
           GV->getType()->getAddressSpace());
+      auto *SaltGV = new GlobalVariable(
+          *M, intType, false, GlobalValue::PrivateLinkage,
+          ConstantInt::get(M->getContext(), Salt), "StringCipherSalt");
+      ciphers[EncryptedRawGV] = {SaltGV, Rotation};
       genedgv.emplace_back(EncryptedRawGV);
       GlobalVariable *DecryptSpaceGV;
       if (rust_string) {
@@ -361,7 +380,7 @@ struct StringEncryption : public ModulePass {
       old2new[GV] = std::make_pair(EncryptedRawGV, DecryptSpaceGV);
       GV2Keys[DecryptSpaceGV] = std::make_pair(KeyConst, EncryptedRawGV);
       mgv2keys[DecryptSpaceGV] = GV2Keys[DecryptSpaceGV];
-      unencryptedindex[KeyConst] = unencryptedindex[GV];
+      unencryptedindex[DecryptSpaceGV] = unencryptedindex[GV];
     }
     // Now prepare ObjC new GV
     for (GlobalVariable *GV : objCStrings) {
@@ -383,7 +402,7 @@ struct StringEncryption : public ModulePass {
       return;
     // Replace Uses
     for (User *U : Users) {
-      for (std::unordered_map<
+      for (MapVector<
                GlobalVariable *,
                std::pair<GlobalVariable *, GlobalVariable *>>::iterator iter =
                old2new.begin();
@@ -403,6 +422,13 @@ struct StringEncryption : public ModulePass {
     // CleanUp Old ObjC GVs
     for (GlobalVariable *GV : objCStrings) {
       GlobalVariable *PtrauthGV = nullptr;
+#if LLVM_VERSION_MAJOR >= 22
+      if (auto *Auth = dyn_cast<ConstantPtrAuth>(GV->getInitializer()->getOperand(0)))
+        if (GV->hasOneUse() && GV->user_back() == Auth && Auth->hasOneUse() &&
+            Auth->user_back() == GV->getInitializer() &&
+            GV->getInitializer()->hasOneUse())
+          GV->setInitializer(Constant::getNullValue(GV->getValueType()));
+#endif
       if (appleptrauth) {
         Constant *C = dyn_cast_or_null<Constant>(
             opaquepointers
@@ -415,8 +441,7 @@ struct StringEncryption : public ModulePass {
                     PtrauthGV->getInitializer()->getOperand(2))) {
               if (GlobalVariable *GV2 =
                       dyn_cast<GlobalVariable>(CE->getOperand(0))) {
-                if (GV->getNumUses() <= 1 &&
-                    GV2->getGlobalIdentifier() == GV->getGlobalIdentifier())
+                if (GV->getNumUses() <= 1 && GV2 == GV)
                   PtrauthGV->getInitializer()->setOperand(
                       2, ConstantExpr::getPtrToInt(
                              M->getGlobalVariable(
@@ -425,8 +450,7 @@ struct StringEncryption : public ModulePass {
               }
             } else if (GlobalVariable *GV2 = dyn_cast<GlobalVariable>(
                            PtrauthGV->getInitializer()->getOperand(2)))
-              if (GV->getNumUses() <= 1 &&
-                  GV2->getGlobalIdentifier() == GV->getGlobalIdentifier())
+              if (GV->getNumUses() <= 1 && GV2 == GV)
                 PtrauthGV->getInitializer()->setOperand(
                     2, ConstantExpr::getPtrToInt(
                            M->getGlobalVariable(
@@ -450,7 +474,7 @@ struct StringEncryption : public ModulePass {
       }
     }
     // CleanUp Old Raw GVs
-    for (std::unordered_map<
+    for (MapVector<
              GlobalVariable *,
              std::pair<GlobalVariable *, GlobalVariable *>>::iterator iter =
              old2new.begin();
@@ -462,16 +486,7 @@ struct StringEncryption : public ModulePass {
         toDelete->eraseFromParent();
       }
     }
-    GlobalVariable *StatusGV = encstatus[Func];
-    /*
-       - Split Original EntryPoint BB into A and C.
-       - Create new BB as Decryption BB between A and C. Adjust the terminators
-         into: A (Alloca a new array containing all)
-               |
-               B(If not decrypted)
-               |
-               C
-     */
+    // Check/decode each referenced string before the original entry code.
     BasicBlock *A = &(Func->getEntryBlock());
     BasicBlock *C = A->splitBasicBlock(A->getFirstNonPHIOrDbgOrLifetime());
     C->setName("PrecedingBlock");
@@ -483,24 +498,6 @@ struct StringEncryption : public ModulePass {
     ReplaceInstWithInst(A->getTerminator(), newBr);
     // Insert DecryptionCode
     HandleDecryptionBlock(B, C, GV2Keys);
-    IRBuilder<> IRB(A->getFirstNonPHIOrDbgOrLifetime());
-    // Add atomic load checking status in A
-    LoadInst *LI = IRB.CreateLoad(StatusGV->getValueType(), StatusGV,
-                                  "LoadEncryptionStatus");
-    LI->setAtomic(
-        AtomicOrdering::Acquire); // Will be released at the start of C
-    LI->setAlignment(Align(4));
-    Value *condition = IRB.CreateICmpEQ(
-        LI, ConstantInt::get(Type::getInt32Ty(Func->getContext()), 0));
-    A->getTerminator()->eraseFromParent();
-    BranchInst::Create(B, C, condition, A);
-    // Add StoreInst atomically in C start
-    // No matter control flow is coming from A or B, the GVs must be decrypted
-    StoreInst *SI =
-        new StoreInst(ConstantInt::get(Type::getInt32Ty(Func->getContext()), 1),
-                      StatusGV, C->getFirstNonPHIOrDbgOrLifetime());
-    SI->setAlignment(Align(4));
-    SI->setAtomic(AtomicOrdering::Release); // Release the lock acquired in LI
   } // End of HandleFunction
 
   GlobalVariable *ObjectiveCString(GlobalVariable *GV, std::string name,
@@ -526,6 +523,15 @@ struct StringEncryption : public ModulePass {
         *(GV->getParent()), newCS->getType(), false, GV->getLinkage(), newCS,
         name, nullptr, GV->getThreadLocalMode(),
         GV->getType()->getAddressSpace());
+#if LLVM_VERSION_MAJOR >= 22
+    if (auto *Auth = dyn_cast<ConstantPtrAuth>(CS->getOperand(0))) {
+      vals[0] = ConstantPtrAuth::get(
+          Auth->getPointer(), Auth->getKey(), Auth->getDiscriminator(),
+          Auth->hasAddressDiscriminator() ? ObjcGV : Auth->getAddrDiscriminator(),
+          Auth->getDeactivationSymbol());
+      ObjcGV->setInitializer(ConstantStruct::get(CS->getType(), vals));
+    }
+#endif
     // for arm64e target on Apple LLVM
     if (appleptrauth) {
       Constant *C = dyn_cast_or_null<Constant>(
@@ -557,32 +563,57 @@ struct StringEncryption : public ModulePass {
 
   void HandleDecryptionBlock(
       BasicBlock *B, BasicBlock *C,
-      std::unordered_map<GlobalVariable *,
+      MapVector<GlobalVariable *,
                          std::pair<Constant *, GlobalVariable *>> &GV2Keys) {
     IRBuilder<> IRB(B);
     Value *zero = ConstantInt::get(Type::getInt32Ty(B->getContext()), 0);
-    for (std::unordered_map<GlobalVariable *,
+    for (MapVector<GlobalVariable *,
                             std::pair<Constant *, GlobalVariable *>>::iterator
              iter = GV2Keys.begin();
          iter != GV2Keys.end(); ++iter) {
-      bool rust_string =
-          !isa<ConstantDataSequential>(iter->first->getInitializer());
+      Module *M = B->getModule();
+      auto *I32 = Type::getInt32Ty(B->getContext());
+      GlobalVariable *&Status = encstatus[iter->first];
+      if (!Status)
+        Status = new GlobalVariable(
+            *M, I32, false, GlobalValue::PrivateLinkage,
+            ConstantInt::get(I32, 0), "StringEncryptionEncStatus", nullptr,
+            iter->first->getThreadLocalMode());
+      Function *F = B->getParent();
+      auto *Check = BasicBlock::Create(B->getContext(), "StringCheck", F, C);
+      auto *Claim = BasicBlock::Create(B->getContext(), "StringClaim", F, C);
+      auto *Decode = BasicBlock::Create(B->getContext(), "StringDecode", F, C);
+      auto *Next = BasicBlock::Create(B->getContext(), "StringNext", F, C);
+      IRB.CreateBr(Check);
+      IRB.SetInsertPoint(Check);
+      auto *State = IRB.CreateLoad(I32, Status);
+      State->setAtomic(AtomicOrdering::Acquire);
+      State->setAlignment(Align(4));
+      IRB.CreateCondBr(IRB.CreateICmpEQ(State, ConstantInt::get(I32, 2)), Next,
+                      Claim);
+      IRB.SetInsertPoint(Claim);
+      // One writer per string, including strings shared by different functions.
+      auto *Lock = IRB.CreateAtomicCmpXchg(
+          Status, ConstantInt::get(I32, 0), ConstantInt::get(I32, 1), Align(4),
+          AtomicOrdering::Acquire, AtomicOrdering::Monotonic);
+      IRB.CreateCondBr(IRB.CreateExtractValue(Lock, 1), Decode, Check);
+      IRB.SetInsertPoint(Decode);
+      bool rust_string = iter->first->getValueType()->isStructTy();
       ConstantAggregate *CA =
           rust_string ? cast<ConstantAggregate>(iter->first->getInitializer())
                       : nullptr;
       Constant *KeyConst = iter->second.first;
-      ConstantDataArray *CastedCDA = cast<ConstantDataArray>(KeyConst);
+      auto *KeyType = cast<ArrayType>(KeyConst->getType());
+      Type *ElementType = KeyType->getElementType();
+      auto Cipher = ciphers.find(iter->second.second)->second;
+      Value *Salt = IRB.CreateLoad(ElementType, Cipher.Salt, true, "StringSalt");
       // Prevent optimization of encrypted data
       appendToCompilerUsed(*iter->second.second->getParent(),
                            {iter->second.second});
-      // Element-By-Element XOR so the fucking verifier won't complain
-      // Also, this hides keys
+      // Build-specific add/rotate/xor encoding; this is obfuscation, not secrecy.
       uint64_t realkeyoff = 0;
-      for (uint64_t i = 0; i < CastedCDA->getType()->getNumElements(); i++) {
-        if (unencryptedindex[KeyConst].size() &&
-            std::find(unencryptedindex[KeyConst].begin(),
-                      unencryptedindex[KeyConst].end(),
-                      i) != unencryptedindex[KeyConst].end())
+      for (uint64_t i = 0; i < KeyType->getNumElements(); i++) {
+        if (llvm::is_contained(unencryptedindex[iter->first], i))
           continue;
         Value *offset =
             ConstantInt::get(Type::getInt64Ty(B->getContext()), realkeyoff);
@@ -601,12 +632,21 @@ struct StringEncryption : public ModulePass {
                       {zero, offset2})
                 : IRB.CreateGEP(iter->first->getValueType(), iter->first,
                                 {zero, offset2});
-        LoadInst *LI = IRB.CreateLoad(CastedCDA->getElementType(), EncryptedGEP,
+        LoadInst *LI = IRB.CreateLoad(ElementType, EncryptedGEP,
                                       "EncryptedChar");
-        Value *XORed = IRB.CreateXor(LI, CastedCDA->getElementAsConstant(i));
-        IRB.CreateStore(XORed, DecryptedGEP);
+        LI->setVolatile(true);
+        Value *XORed = IRB.CreateXor(LI, KeyConst->getAggregateElement(i));
+        Value *Rotated = IRB.CreateOr(
+            IRB.CreateLShr(XORed, Cipher.Rotation),
+            IRB.CreateShl(XORed, ElementType->getIntegerBitWidth() - Cipher.Rotation));
+        IRB.CreateStore(IRB.CreateSub(Rotated, Salt), DecryptedGEP);
         realkeyoff++;
       }
+      auto *Ready = IRB.CreateStore(ConstantInt::get(I32, 2), Status);
+      Ready->setAtomic(AtomicOrdering::Release);
+      Ready->setAlignment(Align(4));
+      IRB.CreateBr(Next);
+      IRB.SetInsertPoint(Next);
     }
     IRB.CreateBr(C);
   } // End of HandleDecryptionBlock

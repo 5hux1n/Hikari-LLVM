@@ -16,10 +16,12 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
 #include "llvm/Transforms/Obfuscation/compat/CallSite.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <fstream>
 #include <set>
 
@@ -67,8 +69,15 @@ struct FunctionCallObfuscate : public FunctionPass {
     if (infile.good()) {
       errs() << "Loading Symbol Configuration From:" << SymbolConfigPath
              << "\n";
-      infile >> this->Configuration;
+      this->Configuration = nlohmann::json::parse(infile, nullptr, false);
+      if (!Configuration.is_object())
+        report_fatal_error("FCO configuration must be a JSON object of symbol names");
+      for (auto It = Configuration.begin(); It != Configuration.end(); ++It)
+        if (!It.value().is_string() || It.value().get<std::string>().empty())
+          report_fatal_error("FCO configuration values must be non-empty symbol strings");
     } else {
+      if (SymbolConfigPath.getNumOccurrences())
+        report_fatal_error(Twine("FCO configuration not found: ") + SymbolConfigPath);
       errs() << "Failed To Load Symbol Configuration From:" << SymbolConfigPath
              << "\n";
     }
@@ -225,35 +234,8 @@ struct FunctionCallObfuscate : public FunctionPass {
       }
     }
     // Fixup llvm.compiler.used, so Verifier won't emit errors
-    if (compilerUsedChanged) {
-      GlobalVariable *CompilerUsedGV =
-          F->getParent()->getGlobalVariable("llvm.compiler.used");
-      if (!CompilerUsedGV)
-        return;
-      ConstantArray *CompilerUsed =
-          dyn_cast<ConstantArray>(CompilerUsedGV->getInitializer());
-      if (!CompilerUsed) {
-        CompilerUsedGV->dropAllReferences();
-        CompilerUsedGV->eraseFromParent();
-        return;
-      }
-      std::vector<Constant *> elements = {};
-      for (unsigned int i = 0; i < CompilerUsed->getNumOperands(); i++) {
-        Constant *Op =
-            CompilerUsed->getAggregateElement(i);
-        if (!Op->isNullValue())
-          elements.emplace_back(Op);
-      }
-      if (elements.size()) {
-        ConstantArray *NewCA = cast<ConstantArray>(
-            ConstantArray::get(CompilerUsed->getType(), elements));
-        CompilerUsedGV->setInitializer(NewCA);
-      }
-      else {
-        CompilerUsedGV->dropAllReferences();
-        CompilerUsedGV->eraseFromParent();
-      }
-    }
+    if (compilerUsedChanged)
+      removeFromUsedLists(*M, [](Constant *C) { return C->isNullValue(); });
   }
   bool runOnFunction(Function &F) override {
     // Construct Function Prototypes
@@ -264,7 +246,8 @@ struct FunctionCallObfuscate : public FunctionPass {
     if (!this->initialized)
       initialize(*M);
     if (!triple.isAndroid() && !triple.isOSDarwin()) {
-      errs() << "Unsupported Target Triple: " << M->getTargetTriple() << "\n";
+      errs() << "Unsupported Target Triple: "
+             << Triple(M->getTargetTriple()).str() << "\n";
       return false;
     }
     FixFunctionConstantExpr(&F);
@@ -282,6 +265,9 @@ struct FunctionCallObfuscate : public FunctionPass {
     Function *dlsym_decl =
         cast<Function>(M->getOrInsertFunction("dlsym", dlsym_type).getCallee());
     // Begin Iteration
+#if LLVM_VERSION_MAJOR >= 22
+    SmallVector<CallBase *, 8> ToAuthenticate;
+#endif
     for (BasicBlock &BB : F) {
       for (Instruction &Inst : BB) {
         if (isa<CallInst>(&Inst) || isa<InvokeInst>(&Inst)) {
@@ -312,8 +298,8 @@ struct FunctionCallObfuscate : public FunctionPass {
           // It's only safe to restrict our modification to external symbols
           // Otherwise stripped binary will crash
           if (!calledFunction->empty() ||
-              calledFunction->getName().equals("dlsym") ||
-              calledFunction->getName().equals("dlopen") ||
+              calledFunction->getName() == "dlsym" ||
+              calledFunction->getName() == "dlopen" ||
               calledFunction->isIntrinsic())
             continue;
 
@@ -333,7 +319,7 @@ struct FunctionCallObfuscate : public FunctionPass {
                 dlopen_flag = ANDROID32_FLAG;
             } else {
               errs() << "[FunctionCallObfuscate] Unsupported Target Triple:"
-                     << M->getTargetTriple() << "\n";
+                     << Triple(M->getTargetTriple()).str() << "\n";
               errs() << "[FunctionCallObfuscate] Applying Default Signature:"
                      << dlopen_flag << "\n";
             }
@@ -348,10 +334,28 @@ struct FunctionCallObfuscate : public FunctionPass {
             Value *bitCastedFunction =
                 IRB.CreateBitCast(fp, CS.getCalledValue()->getType());
             CS.setCalledFunction(bitCastedFunction);
+#if LLVM_VERSION_MAJOR >= 22
+            auto *CB = cast<CallBase>(CS.getInstruction());
+            if (F.hasFnAttribute("ptrauth-calls") &&
+                !CB->getOperandBundle(LLVMContext::OB_ptrauth))
+              ToAuthenticate.push_back(CB);
+#endif
           }
         }
       }
     }
+#if LLVM_VERSION_MAJOR >= 22
+    for (CallBase *CB : ToAuthenticate) {
+      OperandBundleDef Auth("ptrauth", ArrayRef<Value *>{
+          ConstantInt::get(Type::getInt32Ty(M->getContext()), 0),
+          ConstantInt::get(Type::getInt64Ty(M->getContext()), 0)});
+      CallBase *New = CallBase::addOperandBundle(
+          CB, LLVMContext::OB_ptrauth, Auth, CB->getIterator());
+      New->takeName(CB);
+      CB->replaceAllUsesWith(New);
+      CB->eraseFromParent();
+    }
+#endif
     return true;
   }
 };

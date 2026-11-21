@@ -16,259 +16,168 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 #include "llvm/Transforms/Obfuscation/AntiDebugging.h"
-#if LLVM_VERSION_MAJOR >= 17
 #include "llvm/ADT/SmallString.h"
-#include "llvm/TargetParser/Triple.h"
-#else
-#include "llvm/ADT/Triple.h"
-#endif
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
-#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Linker/Linker.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/SourceMgr.h"
-#include "llvm/Support/raw_ostream.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Obfuscation/CryptoUtils.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
-#include <fstream>
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 
 using namespace llvm;
 
-static cl::opt<std::string> PreCompiledIRPath(
-    "adbextirpath",
-    cl::desc("External Path Pointing To Pre-compiled AntiDebugging IR"),
-    cl::value_desc("filename"), cl::init(""));
+static cl::opt<std::string>
+    PreCompiledIRPath("adbextirpath",
+                      cl::desc("External pre-compiled AntiDebugging IR"),
+                      cl::value_desc("filename"), cl::init(""));
 static cl::opt<uint32_t>
     ProbRate("adb_prob",
-             cl::desc("Choose the probability [%] For Each Function To Be "
-                      "Obfuscated By AntiDebugging"),
-             cl::value_desc("Probability Rate"), cl::init(40), cl::Optional);
+             cl::desc("Percentage of functions receiving extra entry guards"),
+             cl::value_desc("Probability Rate"), cl::init(40));
 
 namespace llvm {
+namespace {
 struct AntiDebugging : public ModulePass {
   static char ID;
   bool flag;
-  bool initialized;
-  Triple triple;
-  AntiDebugging() : ModulePass(ID) {
-    this->flag = true;
-    this->initialized = false;
-  }
-  AntiDebugging(bool flag) : ModulePass(ID) {
-    this->flag = flag;
-    this->initialized = false;
-  }
+  AntiDebugging() : ModulePass(ID), flag(true) {}
+  AntiDebugging(bool Flag) : ModulePass(ID), flag(Flag) {}
   StringRef getPassName() const override { return "AntiDebugging"; }
-  bool initialize(Module &M) {
-    if (PreCompiledIRPath == "") {
-      SmallString<32> Path;
-      if (sys::path::home_directory(Path)) { // Stolen from LineEditor.cpp
-        sys::path::append(Path, "Hikari");
-        Triple tri(M.getTargetTriple());
-        sys::path::append(Path, "PrecompiledAntiDebugging-" +
-                                    Triple::getArchTypeName(tri.getArch()) +
-                                    "-" + Triple::getOSTypeName(tri.getOS()) +
-                                    ".bc");
-        PreCompiledIRPath = Path.c_str();
-      }
-    }
-    std::ifstream f(PreCompiledIRPath);
-    if (f.good()) {
-      errs() << "Linking PreCompiled AntiDebugging IR From:"
-             << PreCompiledIRPath << "\n";
-      SMDiagnostic SMD;
-      std::unique_ptr<Module> ADBM(
-          parseIRFile(StringRef(PreCompiledIRPath), SMD, M.getContext()));
-      Linker::linkModules(M, std::move(ADBM), Linker::Flags::LinkOnlyNeeded);
-      // FIXME: Mess with GV in ADBCallBack
-      Function *ADBCallBack = M.getFunction("ADBCallBack");
-      if (ADBCallBack) {
-        assert(!ADBCallBack->isDeclaration() &&
-               "AntiDebuggingCallback is not concrete!");
-        ADBCallBack->setVisibility(
-            GlobalValue::VisibilityTypes::HiddenVisibility);
-        ADBCallBack->setLinkage(GlobalValue::LinkageTypes::PrivateLinkage);
-        ADBCallBack->removeFnAttr(Attribute::AttrKind::NoInline);
-        ADBCallBack->removeFnAttr(Attribute::AttrKind::OptimizeNone);
-        ADBCallBack->addFnAttr(Attribute::AttrKind::AlwaysInline);
-      }
-      Function *ADBInit = M.getFunction("InitADB");
-      if (ADBInit) {
-        assert(!ADBInit->isDeclaration() &&
-               "AntiDebuggingInitializer is not concrete!");
-        ADBInit->setVisibility(GlobalValue::VisibilityTypes::HiddenVisibility);
-        ADBInit->setLinkage(GlobalValue::LinkageTypes::PrivateLinkage);
-        ADBInit->removeFnAttr(Attribute::AttrKind::NoInline);
-        ADBInit->removeFnAttr(Attribute::AttrKind::OptimizeNone);
-        ADBInit->addFnAttr(Attribute::AttrKind::AlwaysInline);
-      }
+
+  Function *createBuiltin(Module &M, const Triple &Target) {
+    LLVMContext &C = M.getContext();
+    Function *Init =
+        Function::Create(FunctionType::get(Type::getVoidTy(C), false),
+                         GlobalValue::PrivateLinkage, "__hikari_adb_init", M);
+    Init->addFnAttr("hikari.runtime");
+    Init->addFnAttr(Attribute::NoInline);
+    Init->addFnAttr(Attribute::NoUnwind);
+    auto *Done = new GlobalVariable(
+        M, Type::getInt8Ty(C), false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(Type::getInt8Ty(C), 0), "__hikari_adb_done");
+    Done->setAlignment(Align(1));
+    BasicBlock *Entry = BasicBlock::Create(C, "entry", Init);
+    BasicBlock *Check = BasicBlock::Create(C, "check", Init);
+    BasicBlock *Success = BasicBlock::Create(C, "success", Init);
+    BasicBlock *Failure = BasicBlock::Create(C, "failure", Init);
+    BasicBlock *Exit = BasicBlock::Create(C, "exit", Init);
+    IRBuilder<> B(Entry);
+    auto *Loaded = B.CreateLoad(B.getInt8Ty(), Done);
+    Loaded->setAtomic(AtomicOrdering::Acquire);
+    B.CreateCondBr(B.CreateICmpNE(Loaded, B.getInt8(0)), Exit, Check);
+    B.SetInsertPoint(Check);
+    Value *Result;
+    if (Target.isAArch64()) {
+      // Darwin reports syscall errors in carry; declare every overwritten
+      // register.
+      InlineAsm *IA = InlineAsm::get(
+          FunctionType::get(B.getInt64Ty(), false),
+          "mov x0, #31\nmov x1, #0\nmov x2, #0\nmov x3, #0\n"
+          "mov x16, #26\nsvc #0x80\ncneg x0, x0, cs",
+          "={x0},~{x1},~{x2},~{x3},~{x16},~{x17},~{cc},~{memory}", true);
+      Result = B.CreateCall(IA->getFunctionType(), IA);
     } else {
-      errs() << "Failed To Link PreCompiled AntiDebugging IR From:"
-             << PreCompiledIRPath << "\n";
+      auto Ptrace = M.getOrInsertFunction(
+          "ptrace", FunctionType::get(B.getInt32Ty(),
+                                      {B.getInt32Ty(), B.getInt32Ty(),
+                                       B.getPtrTy(), B.getInt32Ty()},
+                                      false));
+      Result = B.CreateCall(Ptrace, {B.getInt32(31), B.getInt32(0),
+                                     ConstantPointerNull::get(B.getPtrTy()),
+                                     B.getInt32(0)});
     }
-    this->initialized = true;
-    this->triple = Triple(M.getTargetTriple());
-    return true;
+    B.CreateCondBr(
+        B.CreateICmpEQ(Result, ConstantInt::get(Result->getType(), 0)), Success,
+        Failure);
+    B.SetInsertPoint(Success);
+    auto *Store = B.CreateStore(B.getInt8(1), Done);
+    Store->setAtomic(AtomicOrdering::Release);
+    B.CreateBr(Exit);
+    B.SetInsertPoint(Failure);
+    B.CreateIntrinsic(Intrinsic::trap, ArrayRef<Type *>{}, {});
+    B.CreateUnreachable();
+    B.SetInsertPoint(Exit);
+    B.CreateRetVoid();
+    return Init;
   }
+
+  Function *initialize(Module &M, const Triple &Target) {
+    SmallString<128> Path(PreCompiledIRPath.getValue());
+    if (Path.empty() && sys::path::home_directory(Path)) {
+      sys::path::append(Path, "Hikari",
+                        "PrecompiledAntiDebugging-" +
+                            Triple::getArchTypeName(Target.getArch()) + "-" +
+                            Triple::getOSTypeName(Target.getOS()) + ".bc");
+    }
+    if (!Path.empty() && sys::fs::exists(Path)) {
+      SMDiagnostic Diagnostic;
+      auto IR = parseIRFile(Path, Diagnostic, M.getContext());
+      if (!IR) {
+        Diagnostic.print("Hikari AntiDebugging", errs());
+        report_fatal_error("Cannot parse AntiDebugging IR");
+      }
+      for (Function &F : *IR)
+        if (!F.isDeclaration())
+          F.addFnAttr("hikari.runtime");
+      if (Linker::linkModules(M, std::move(IR)))
+        report_fatal_error("Cannot link AntiDebugging IR");
+      Function *Init = M.getFunction("InitADB");
+      if (!Init || Init->isDeclaration() ||
+          Init->getFunctionType() !=
+              FunctionType::get(Type::getVoidTy(M.getContext()), false))
+        report_fatal_error("AntiDebugging IR must define void InitADB(void)");
+      for (StringRef Name : {"InitADB", "ADBCallBack"})
+        if (Function *F = M.getFunction(Name)) {
+          F->addFnAttr("hikari.runtime");
+          F->setLinkage(GlobalValue::InternalLinkage);
+        }
+      return Init;
+    }
+    if (!PreCompiledIRPath.empty())
+      report_fatal_error(Twine("AntiDebugging IR not found: ") +
+                         PreCompiledIRPath);
+    errs() << "Using built-in AntiDebugging for " << Target.str() << "\n";
+    return createBuiltin(M, Target);
+  }
+
   bool runOnModule(Module &M) override {
-    if (ProbRate > 100) {
-      errs() << "AntiDebugging application function percentage "
-                "-adb_prob=x must be 0 < x <= 100";
+    SmallVector<Function *, 16> Functions;
+    for (Function &F : M)
+      if (F.getName() != "InitADB" && F.getName() != "ADBCallBack" &&
+          toObfuscate(flag, &F, "adb"))
+        Functions.push_back(&F);
+    if (Functions.empty())
       return false;
-    }
-    for (Function &F : M) {
-      if (toObfuscate(flag, &F, "adb") && F.getName() != "ADBCallBack" &&
-          F.getName() != "InitADB") {
-        errs() << "Running AntiDebugging On " << F.getName() << "\n";
-        if (!this->initialized)
-          initialize(M);
-        if (cryptoutils->get_range(100) <= ProbRate)
-          runOnFunction(F);
+    if (ProbRate == 0 || ProbRate > 100)
+      report_fatal_error("-adb_prob must be between 1 and 100");
+    Triple Target(M.getTargetTriple());
+    if (!Target.isOSDarwin())
+      report_fatal_error("AntiDebugging requires an Apple Darwin target");
+    Function *Init = initialize(M, Target);
+    // A load-time guard cannot depend on a random choice or a function being
+    // called.
+    appendToGlobalCtors(M, Init, 0);
+    for (Function *F : Functions)
+      if (cryptoutils->get_range(100) < ProbRate) {
+        IRBuilder<> B(&*F->getEntryBlock().getFirstInsertionPt());
+        B.CreateCall(Init);
       }
-    }
-    return true;
-  }
-  bool runOnFunction(Function &F) {
-    BasicBlock *EntryBlock = &(F.getEntryBlock());
-    // Now operate on Linked AntiDBGCallbacks
-    Function *ADBCallBack = F.getParent()->getFunction("ADBCallBack");
-    Function *ADBInit = F.getParent()->getFunction("InitADB");
-    if (ADBCallBack && ADBInit) {
-      CallInst::Create(ADBInit, "",
-                       cast<Instruction>(EntryBlock->getFirstInsertionPt()));
-    } else {
-      errs() << "The ADBCallBack and ADBInit functions were not found\n";
-      if (!F.getReturnType()
-               ->isVoidTy()) // We insert InlineAsm in the Terminator, which
-                             // causes register contamination if the return type
-                             // is not Void.
-        return false;
-      if (triple.isOSDarwin() && triple.isAArch64()) {
-        errs() << "Injecting Inline Assembly AntiDebugging For:"
-               << F.getParent()->getTargetTriple() << "\n";
-        std::string antidebugasm = "";
-        switch (cryptoutils->get_range(2)) {
-        case 0: {
-          std::string s[] = {"mov x0, #31\n", "mov w0, #31\n", "mov x1, #0\n",
-                             "mov w1, #0\n",  "mov x2, #0\n",  "mov w2, #0\n",
-                             "mov x3, #0\n",  "mov w3, #0\n",  "mov x16, #26\n",
-                             "mov w16, #26\n"}; // svc ptrace
-          bool c[5] = {false, false, false, false, false};
-          while (c[0] != true || c[1] != true || c[2] != true || c[3] != true ||
-                 c[4] != true) {
-            switch (cryptoutils->get_range(5)) {
-            case 0:
-              if (!c[0]) {
-                antidebugasm += s[cryptoutils->get_range(2)];
-                c[0] = true;
-              }
-              break;
-            case 1:
-              if (!c[1]) {
-                antidebugasm += s[2 + cryptoutils->get_range(2)];
-                c[1] = true;
-              }
-              break;
-            case 2:
-              if (!c[2]) {
-                antidebugasm += s[4 + cryptoutils->get_range(2)];
-                c[2] = true;
-              }
-              break;
-            case 3:
-              if (!c[3]) {
-                antidebugasm += s[6 + cryptoutils->get_range(2)];
-                c[3] = true;
-              }
-              break;
-            case 4:
-              if (!c[4]) {
-                antidebugasm += s[8 + cryptoutils->get_range(2)];
-                c[4] = true;
-              }
-              break;
-            default:
-              break;
-            }
-          }
-          break;
-        }
-        case 1: {
-          std::string s[] = {"mov x0, #26\n", "mov w0, #26\n", "mov x1, #31\n",
-                             "mov w1, #31\n", "mov x2, #0\n",  "mov w2, #0\n",
-                             "mov x3, #0\n",  "mov w3, #0\n",  "mov x16, #0\n",
-                             "mov w16, #0\n"}; // svc syscall ptrace
-          bool c[5] = {false, false, false, false, false};
-          while (c[0] != true || c[1] != true || c[2] != true || c[3] != true ||
-                 c[4] != true) {
-            switch (cryptoutils->get_range(5)) {
-            case 0:
-              if (!c[0]) {
-                antidebugasm += s[cryptoutils->get_range(2)];
-                c[0] = true;
-              }
-              break;
-            case 1:
-              if (!c[1]) {
-                antidebugasm += s[2 + cryptoutils->get_range(2)];
-                c[1] = true;
-              }
-              break;
-            case 2:
-              if (!c[2]) {
-                antidebugasm += s[4 + cryptoutils->get_range(2)];
-                c[2] = true;
-              }
-              break;
-            case 3:
-              if (!c[3]) {
-                antidebugasm += s[6 + cryptoutils->get_range(2)];
-                c[3] = true;
-              }
-              break;
-            case 4:
-              if (!c[4]) {
-                antidebugasm += s[8 + cryptoutils->get_range(2)];
-                c[4] = true;
-              }
-              break;
-            default:
-              break;
-            }
-          }
-          break;
-        }
-        }
-        antidebugasm +=
-            "svc #" + std::to_string(cryptoutils->get_range(65536)) + "\n";
-        InlineAsm *IA = InlineAsm::get(
-            FunctionType::get(Type::getVoidTy(EntryBlock->getContext()), false),
-            antidebugasm, "", true, false);
-        Instruction *I = nullptr;
-        for (BasicBlock &BB : F)
-          I = BB.getTerminator();
-#if LLVM_VERSION_MAJOR >= 16
-        CallInst::Create(IA, std::nullopt, "", I);
-#else
-        CallInst::Create(IA, None, "", I);
-#endif
-      } else {
-        errs() << "Unsupported Inline Assembly AntiDebugging Target: "
-               << F.getParent()->getTargetTriple() << "\n";
-      }
-    }
     return true;
   }
 };
-
-ModulePass *createAntiDebuggingPass(bool flag) {
-  return new AntiDebugging(flag);
+} // namespace
+ModulePass *createAntiDebuggingPass(bool Flag) {
+  return new AntiDebugging(Flag);
 }
-} // namespace llvm
-
 char AntiDebugging::ID = 0;
 INITIALIZE_PASS(AntiDebugging, "adb", "Enable AntiDebugging.", false, false)
+} // namespace llvm
