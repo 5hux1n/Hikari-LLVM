@@ -199,16 +199,6 @@ struct ConstantEncryption : public ModulePass {
     return false;
   }
 
-  bool isAtomicLoaded(GlobalVariable *GV) {
-    for (User *U : GV->users()) {
-      if (LoadInst *LI = dyn_cast<LoadInst>(U)) {
-        if (LI->isAtomic())
-          return true;
-      }
-    }
-    return false;
-  }
-
   void EncryptConstants(Function &F) {
     for (Instruction &I : instructions(F)) {
       if (!shouldEncryptConstant(&I))
@@ -289,54 +279,48 @@ struct ConstantEncryption : public ModulePass {
   }
 
   void HandleConstantIntInitializerGV(GlobalVariable *GVPtr) {
-    if (!(flag || AreUsersInOneFunction(GVPtr)) || isDispatchOnceToken(GVPtr) ||
-        isAtomicLoaded(GVPtr))
+    if (!handled_gvs.insert(GVPtr).second ||
+        GVPtr->isExternallyInitialized() || GVPtr->hasSection() ||
+        !(flag || AreUsersInOneFunction(GVPtr)) || isDispatchOnceToken(GVPtr))
       return;
-    // Prepare Types and Keys
-    std::pair<ConstantInt *, ConstantInt *> keyandnew;
-    ConstantInt *Old = dyn_cast<ConstantInt>(GVPtr->getInitializer());
-    bool hasHandled = true;
-    if (handled_gvs.find(GVPtr) == handled_gvs.end()) {
-      hasHandled = false;
-      keyandnew = PairConstantInt(Old);
-      handled_gvs.insert(GVPtr);
+
+    // Every access must be rewritten together with the initializer. An alias,
+    // escaped pointer, or special memory access may observe the raw storage.
+    Type *ValueType = GVPtr->getValueType();
+    for (User *U : GVPtr->users()) {
+      if (auto *Load = dyn_cast<LoadInst>(U)) {
+        if (!Load->isSimple() || Load->getType() != ValueType)
+          return;
+      } else if (auto *Store = dyn_cast<StoreInst>(U)) {
+        if (!Store->isSimple() || Store->getPointerOperand() != GVPtr ||
+            Store->getValueOperand()->getType() != ValueType)
+          return;
+      } else {
+        return;
+      }
     }
-    ConstantInt *XORKey = keyandnew.first;
-    ConstantInt *newGVInit = keyandnew.second;
-    if (hasHandled || !XORKey || !newGVInit)
+
+    auto [XORKey, newGVInit] =
+        PairConstantInt(cast<ConstantInt>(GVPtr->getInitializer()));
+    if (!XORKey)
       return;
     GVPtr->setInitializer(newGVInit);
-    bool isSigned = XORKey->getValue().isSignBitSet() ||
-                    newGVInit->getValue().isSignBitSet() ||
-                    Old->getValue().isSignBitSet();
     for (User *U : GVPtr->users()) {
-      BinaryOperator *XORInst = nullptr;
-      if (LoadInst *LI = dyn_cast<LoadInst>(U)) {
-        if (LI->getType() != XORKey->getType()) {
-          Instruction *IntegerCast =
-              BitCastInst::CreateIntegerCast(LI, XORKey->getType(), isSigned);
-          IntegerCast->insertAfter(LI);
-          XORInst =
-              BinaryOperator::Create(Instruction::Xor, IntegerCast, XORKey);
-          XORInst->insertAfter(IntegerCast);
-          Instruction *IntegerCast2 =
-              BitCastInst::CreateIntegerCast(XORInst, LI->getType(), isSigned);
-          IntegerCast2->insertAfter(XORInst);
-          LI->replaceUsesWithIf(IntegerCast2, [IntegerCast](Use &U) {
-            return U.getUser() != IntegerCast;
-          });
-        } else {
-          XORInst = BinaryOperator::Create(Instruction::Xor, LI, XORKey);
-          XORInst->insertAfter(LI);
-          LI->replaceUsesWithIf(
-              XORInst, [XORInst](Use &U) { return U.getUser() != XORInst; });
-        }
-      } else if (StoreInst *SI = dyn_cast<StoreInst>(U)) {
-        XORInst = BinaryOperator::Create(Instruction::Xor, SI->getOperand(0),
-                                         XORKey, "", SI);
-        SI->replaceUsesOfWith(SI->getValueOperand(), XORInst);
+      BinaryOperator *XORInst;
+      if (auto *Load = dyn_cast<LoadInst>(U)) {
+        // A range attached to the original value may exclude the encoded one.
+        Load->setMetadata(LLVMContext::MD_range, nullptr);
+        XORInst = BinaryOperator::Create(Instruction::Xor, Load, XORKey);
+        XORInst->insertAfter(Load);
+        Load->replaceUsesWithIf(
+            XORInst, [XORInst](Use &U) { return U.getUser() != XORInst; });
+      } else {
+        auto *Store = cast<StoreInst>(U);
+        XORInst = BinaryOperator::Create(
+            Instruction::Xor, Store->getValueOperand(), XORKey, "", Store);
+        Store->setOperand(0, XORInst);
       }
-      if (XORInst && SubstituteXorTemp &&
+      if (SubstituteXorTemp &&
           cryptoutils->get_range(100) <= SubstituteXorProbTemp)
         SubstituteImpl::substituteXor(XORInst);
     }

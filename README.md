@@ -35,7 +35,7 @@ cmake --build cmake-build-arm64e --parallel 1
 Apple Clang 前端 → LLVM 22 Hikari 混淆 → IR 校验与兼容处理 → Apple Clang 后端
 ```
 
-链接仍交给 Apple 工具链。前端接受工程原有的优化参数，**Apple 后端默认使用 `-O0`**，减少混淆表达式被再次简化；可用 `HIKARI_APPLE_OPT=1` 或 `2` 做对照。
+链接仍交给 Apple 工具链。编译入口保留 `-g` 调试信息，使用该入口时请关闭 LTO（`-fno-lto`）。前端接受工程原有的优化参数，**Apple 后端默认使用 `-O0`**，减少混淆表达式被再次简化；可用 `HIKARI_APPLE_OPT=1` 或 `2` 做对照。
 
 ### 只保护关键函数
 
@@ -147,6 +147,10 @@ export HIKARI_FLAGS="-enable-strcry -strcry_prob=100"
 - iOS 设备上的启动、后台切换及 arm64e / PAC 执行。
 
 压缩包体积不能代表混淆强度，也不能代替解包后的二进制检查。变换会增加体积和运行开销，应按关键逻辑的实际表现选择配置。
+
+## 运行插件测试
+
+构建独立插件后运行 `ctest --test-dir cmake-build-arm64e --output-on-failure`。Apple 后端测试默认使用 `xcrun` 选中的 Xcode，也可以在配置时通过 `-DHIKARI_TEST_APPLE_CLANG=/path/to/clang` 指定编译器。
 
 ## 完整 LLVM / Clang 构建
 

@@ -2,6 +2,7 @@
 // [License](https://github.com/HikariObfuscator/Hikari/wiki/License).
 //===----------------------------------------------------------------------===//
 #include "llvm/Transforms/Obfuscation/Utils.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -79,52 +80,78 @@ void fixStack(Function *f) {
   } while (tmpReg.size() != 0 || tmpPhi.size() != 0);
 }
 
-// Unlike O-LLVM which uses __attribute__ that is not supported by the ObjC
-// CFE. We use a dummy call here and remove the call later Very dumb and
-// definitely slower than the function attribute method Merely a hack
-bool readFlag(Function *f, std::string attribute) {
-  for (Instruction &I : instructions(f)) {
-    Instruction *Inst = &I;
-    if (CallInst *CI = dyn_cast<CallInst>(Inst)) {
-      if (CI->getCalledFunction() != nullptr &&
-#if LLVM_VERSION_MAJOR >= 18
-          CI->getCalledFunction()->getName().starts_with("hikari_" +
-                                                         attribute)) {
-#else
-          CI->getCalledFunction()->getName().startswith("hikari_" +
-                                                        attribute)) {
-#endif
-        CI->eraseFromParent();
-        return true;
-      }
-    }
-    if (InvokeInst *II = dyn_cast<InvokeInst>(Inst)) {
-      if (II->getCalledFunction() != nullptr &&
-#if LLVM_VERSION_MAJOR >= 18
-          II->getCalledFunction()->getName().starts_with("hikari_" +
-                                                         attribute)) {
-#else
-          II->getCalledFunction()->getName().startswith("hikari_" +
-                                                        attribute)) {
-#endif
-        BasicBlock *normalDest = II->getNormalDest();
-        BasicBlock *unwindDest = II->getUnwindDest();
-        BasicBlock *parent = II->getParent();
-        if (parent->size() == 1) {
-          parent->replaceAllUsesWith(normalDest);
-          II->eraseFromParent();
-          parent->eraseFromParent();
-        } else {
-          BranchInst::Create(normalDest, II);
-          II->eraseFromParent();
-        }
-        if (pred_size(unwindDest) == 0)
-          unwindDest->eraseFromParent();
-        return true;
-      }
-    }
+// Legacy flag calls are declarations with a void result and either no
+// arguments or one constant integer argument. Real functions remain callable.
+static CallBase *getMarkerCall(Instruction &I, bool HasValue) {
+  if (!isa<CallInst>(I) && !isa<InvokeInst>(I))
+    return nullptr;
+  auto *Call = cast<CallBase>(&I);
+  Function *Callee = Call->getCalledFunction();
+  if (!Callee || !Callee->isDeclaration() || Callee->isVarArg() ||
+      !Call->getType()->isVoidTy() || Call->hasOperandBundles() ||
+      Call->arg_size() != unsigned(HasValue))
+    return nullptr;
+  if (HasValue) {
+    auto *Arg = dyn_cast<ConstantInt>(Call->getArgOperand(0));
+    if (!Arg || Arg->getValue().getActiveBits() > 32)
+      return nullptr;
   }
-  return false;
+  return Call;
+}
+
+static void eraseMarkerCall(CallBase *Call) {
+  if (auto *Invoke = dyn_cast<InvokeInst>(Call))
+    Call = changeToCall(Invoke);
+  Call->eraseFromParent();
+}
+
+static bool consumeMarker(Function &F, StringRef Name, uint32_t *Value = nullptr) {
+  bool Found = false;
+  for (Instruction &I : make_early_inc_range(instructions(F))) {
+    CallBase *Call = getMarkerCall(I, Value != nullptr);
+    if (!Call || Call->getCalledFunction()->getName() != Name)
+      continue;
+    if (Value && !Found)
+      *Value = cast<ConstantInt>(Call->getArgOperand(0))->getZExtValue();
+    Found = true;
+    eraseMarkerCall(Call);
+  }
+  return Found;
+}
+
+bool readFlag(Function *F, std::string Attribute) {
+  return consumeMarker(*F, "hikari_" + Attribute);
+}
+
+void removeUnusedMarkerCalls(Module &M) {
+  for (Function &F : M) {
+    StringRef Name = F.getName();
+    if (!F.isDeclaration() || !Name.consume_front("hikari_"))
+      continue;
+
+    bool Negated = Name.consume_front("no");
+    static constexpr StringLiteral BoolMarkers[] = {
+        "adb", "antihook", "bcf", "constenc", "fco", "fla", "fw",
+        "indibr", "split", "strenc", "sub", "ah_inline", "ah_objcruntime",
+        "ah_antirebind", "bcf_junkasm", "bcf_onlyjunkasm", "bcf_createfunc",
+        "constenc_togv", "constenc_subxor", "indibran_use_stack",
+        "indibran_enc_jump_target"};
+    static constexpr StringLiteral UintMarkers[] = {
+        "sub_loop", "sub_prob", "strcry_prob", "constenc_times",
+        "constenc_subxor_prob", "constenc_togv_prob", "fw_prob", "split_num",
+        "bcf_loop", "bcf_prob", "bcf_junkasm_maxnum", "bcf_junkasm_minnum",
+        "bcf_cond_compl"};
+    bool IsBool = is_contained(BoolMarkers, Name);
+    bool IsUint = !Negated && is_contained(UintMarkers, Name);
+    if (!IsBool && !IsUint)
+      continue;
+
+    for (User *U : make_early_inc_range(F.users()))
+      if (auto *I = dyn_cast<Instruction>(U))
+        if (CallBase *Call = getMarkerCall(*I, IsUint))
+          if (Call->getCalledFunction() == &F)
+            eraseMarkerCall(Call);
+  }
 }
 
 bool toObfuscate(bool flag, Function *f, std::string attribute) {
@@ -197,51 +224,8 @@ bool readAnnotationMetadataUint32OptVal(Function *f, std::string opt,
   return false;
 }
 
-bool readFlagUint32OptVal(Function *f, std::string opt, uint32_t *val) {
-  for (Instruction &I : instructions(f)) {
-    Instruction *Inst = &I;
-    if (CallInst *CI = dyn_cast<CallInst>(Inst)) {
-      if (CI->getCalledFunction() != nullptr &&
-#if LLVM_VERSION_MAJOR >= 18
-          CI->getCalledFunction()->getName().starts_with("hikari_" + opt)) {
-#else
-          CI->getCalledFunction()->getName().startswith("hikari_" + opt)) {
-#endif
-        if (ConstantInt *C = dyn_cast<ConstantInt>(CI->getArgOperand(0))) {
-          *val = (uint32_t)C->getValue().getZExtValue();
-          CI->eraseFromParent();
-          return true;
-        }
-      }
-    }
-    if (InvokeInst *II = dyn_cast<InvokeInst>(Inst)) {
-      if (II->getCalledFunction() != nullptr &&
-#if LLVM_VERSION_MAJOR >= 18
-          II->getCalledFunction()->getName().starts_with("hikari_" + opt)) {
-#else
-          II->getCalledFunction()->getName().startswith("hikari_" + opt)) {
-#endif
-        if (ConstantInt *C = dyn_cast<ConstantInt>(II->getArgOperand(0))) {
-          *val = (uint32_t)C->getValue().getZExtValue();
-          BasicBlock *normalDest = II->getNormalDest();
-          BasicBlock *unwindDest = II->getUnwindDest();
-          BasicBlock *parent = II->getParent();
-          if (parent->size() == 1) {
-            parent->replaceAllUsesWith(normalDest);
-            II->eraseFromParent();
-            parent->eraseFromParent();
-          } else {
-            BranchInst::Create(normalDest, II);
-            II->eraseFromParent();
-          }
-          if (pred_size(unwindDest) == 0)
-            unwindDest->eraseFromParent();
-          return true;
-        }
-      }
-    }
-  }
-  return false;
+bool readFlagUint32OptVal(Function *F, std::string Option, uint32_t *Value) {
+  return consumeMarker(*F, "hikari_" + Option, Value);
 }
 
 bool toObfuscateUint32Option(Function *f, std::string option, uint32_t *val) {

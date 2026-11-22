@@ -38,3 +38,40 @@ execute_process(COMMAND git rev-parse --short HEAD
   WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
   OUTPUT_VARIABLE HIKARI_REVISION OUTPUT_STRIP_TRAILING_WHITESPACE)
 target_compile_definitions(Hikari PRIVATE GIT_COMMIT_HASH="${HIKARI_REVISION}")
+
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(HikariCryptoUtilsTest
+    tests/CryptoUtilsTest.cpp
+    "${OBFUSCATION}/CryptoUtils.cpp")
+  target_compile_features(HikariCryptoUtilsTest PRIVATE cxx_std_17)
+  target_link_libraries(HikariCryptoUtilsTest PRIVATE LLVM)
+  target_include_directories(HikariCryptoUtilsTest PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/include")
+  target_include_directories(HikariCryptoUtilsTest SYSTEM PRIVATE "${LLVM_INCLUDE_DIRS}")
+  add_test(NAME hikari-crypto COMMAND HikariCryptoUtilsTest)
+
+  if(APPLE)
+    find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+    set(HIKARI_TEST_APPLE_CLANG "" CACHE FILEPATH
+      "Apple Clang for backend tests (defaults to xcrun --find clang)")
+    set(hikari_apple_args)
+    if(HIKARI_TEST_APPLE_CLANG)
+      list(APPEND hikari_apple_args --apple "${HIKARI_TEST_APPLE_CLANG}")
+    endif()
+
+    foreach(test IN ITEMS smoke regressions apple_backend)
+      set(test_args)
+      if(test STREQUAL "apple_backend")
+        set(test_args ${hikari_apple_args})
+      endif()
+      add_test(NAME hikari-${test}
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/${test}.py"
+          --llvm-bin "${LLVM_TOOLS_BINARY_DIR}"
+          --plugin "$<TARGET_FILE:Hikari>"
+          --output "${CMAKE_CURRENT_BINARY_DIR}/test-results/${test}"
+          ${test_args})
+      set_tests_properties(hikari-${test} PROPERTIES
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1" TIMEOUT 600)
+    endforeach()
+  endif()
+endif()

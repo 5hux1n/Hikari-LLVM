@@ -107,10 +107,9 @@ struct Obfuscation : public ModulePass {
     return "HikariObfuscationScheduler";
   }
   bool runOnModule(Module &M) override {
-    TimerGroup *tg =
-        new TimerGroup("Obfuscation Timer Group", "Obfuscation Timer Group");
-    Timer *timer = new Timer("Obfuscation Timer", "Obfuscation Timer", *tg);
-    timer->startTimer();
+    TimerGroup Group("Obfuscation Timer Group", "Obfuscation Timer Group");
+    Timer Elapsed("Obfuscation Timer", "Obfuscation Timer", Group);
+    Elapsed.startTimer();
 
     errs() << "Running Hikari On " << M.getSourceFileName() << "\n";
 
@@ -178,29 +177,14 @@ struct Obfuscation : public ModulePass {
                                    EnableFunctionWrapper);
     MP->runOnModule(M);
     delete MP;
-    // Cleanup Flags
-    SmallVector<Function *, 8> toDelete;
-    for (Function &F : M)
-      if (F.isDeclaration() && F.hasName() &&
-#if LLVM_VERSION_MAJOR >= 18
-          F.getName().starts_with("hikari_")) {
-#else
-          F.getName().startswith("hikari_")) {
-#endif
-        for (User *U : F.users())
-          if (Instruction *Inst = dyn_cast<Instruction>(U))
-            Inst->eraseFromParent();
-        toDelete.emplace_back(&F);
-      }
-    for (Function *F : toDelete)
-      F->eraseFromParent();
+    removeUnusedMarkerCalls(M);
 
-    timer->stopTimer();
+    Elapsed.stopTimer();
     errs() << "Hikari Out\n";
     errs() << "Spend Time: "
-           << format("%.7f", timer->getTotalTime().getWallTime()) << "s"
+           << format("%.7f", Elapsed.getTotalTime().getWallTime()) << "s"
            << "\n";
-    tg->clearAll();
+    Group.clear();
     return true;
   } // End runOnModule
 };

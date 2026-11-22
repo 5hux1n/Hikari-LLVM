@@ -7,6 +7,7 @@
 namespace llvm {
 
 void fixStack(Function *f);
+void removeUnusedMarkerCalls(Module &M);
 bool toObfuscate(bool flag, Function *f, std::string attribute);
 bool toObfuscateBoolOption(Function *f, std::string option, bool *val);
 bool toObfuscateUint32Option(Function *f, std::string option, uint32_t *val);
